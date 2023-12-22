@@ -417,3 +417,223 @@ mod once_box {
     /// ```
     fn _dummy() {}
 }
+
+pub use once_spin::OnceSpin;
+
+mod once_spin {
+    use super::atomic::{Ordering, AtomicUsize};
+    use super::UnsafeCell;
+    use core::mem::MaybeUninit;
+    use core::hint::spin_loop;
+
+    /// A thread-safe cell which can only be written to once. Note that the
+    /// functions suffixed with `_spin` will spinloop in rare cases, and that
+    /// other implementations are preferred if possible.
+    pub struct OnceSpin<T> {
+        /// The actual storage of the stored object
+        data_holder: UnsafeCell<MaybeUninit<T>>,
+        /// Tracks whether the OnceSpin has been initialized
+        /// 0 -> no
+        /// 1 -> write in progress (because writing to data_holder is not atomic)
+        /// 2 -> init
+        /// This value can only ever increase in increments of 1
+        is_init: AtomicUsize,
+        #[cfg(debug_assertions)]
+        /// Helper counter to assert that the critical section is, in fact, only entered by one thread at a time
+        critical_section_ctr: AtomicUsize
+    }
+    impl<T> OnceSpin<T> {
+        /// Creates a new empty cell.
+        #[inline]
+        pub const fn new() -> Self {
+            Self {
+                data_holder: UnsafeCell::new(MaybeUninit::uninit()),
+                is_init: AtomicUsize::new(0),
+                #[cfg(debug_assertions)]
+                critical_section_ctr: AtomicUsize::new(0)
+            }
+        }
+        /// Gets a reference to the underlying value.
+        ///
+        /// SAFETY: callers must ensure that the OnceSpin is initialized.
+        #[inline]
+        unsafe fn get_data_unchecked(&self) -> &T {
+            let mut_ptr = self.data_holder.get();
+            (&*mut_ptr as &MaybeUninit<T>).assume_init_ref()
+        }
+        /// Gets a reference to the underlying value.
+        pub fn get(&self) -> Option<&T> {
+            let state_snapshot = self.is_init.load(Ordering::Acquire);
+            if state_snapshot == 2 {
+                #[cfg(debug_assertions)]
+                assert_eq!(self.critical_section_ctr.load(Ordering::SeqCst), 0);
+                // SAFETY: 2 -> value is init and nobody is trying to change it
+                unsafe {
+                    Some(self.get_data_unchecked())
+                }
+            } else {
+                debug_assert!(state_snapshot <= 1);
+                None
+            }
+        }
+        /// Forcibly sets the value of the cell and returns a mutable reference
+        /// to the new value.
+        ///
+        /// SAFETY: The internal state must be set to the intermediate state before
+        /// this is called. If the internal value was already set, then this
+        /// function overwrites it without dropping it, potentially causing races.
+        unsafe fn force_set(&self, value: T) -> &mut T {
+            #[cfg(debug_assertions)]
+            assert_eq!(self.critical_section_ctr.fetch_add(1, Ordering::SeqCst), 0);
+            let value_ref: &mut T = unsafe {
+                let mut_ptr = self.data_holder.get();
+                (&mut *mut_ptr as &mut MaybeUninit<T>).write(value)
+            };
+            #[cfg(debug_assertions)]
+            assert_eq!(self.critical_section_ctr.fetch_sub(1, Ordering::SeqCst), 1);
+            value_ref
+        }
+
+        /// Sets the contents of this cell to `value`.
+        ///
+        /// Returns `Ok(())` if the cell was empty and `Err(value)` if it was full.
+        pub fn set(&self, value: T) -> Result<(), T> {
+            // Indicate that we are now trying to set the value
+            // If someone else is also trying, back off and let them go through
+            // On success we wish to release the new state, already knowing it
+            // On failure we don't need an ordering, as the failure already forms
+            // a happens-before relationship between their set and our check
+            if self.is_init.compare_exchange(0, 1, Ordering::Release, Ordering::Relaxed).is_err() {
+                return Err(value);
+            }
+            // SAFETY: state==1 -> nobody else is touching the UnsafeCell -> we can safely obtain &mut
+            unsafe {
+                self.force_set(value);
+            }
+            // Indicate that we have successfully written the value
+            if self.is_init.swap(2, Ordering::AcqRel) != 1 {
+                unreachable!("Concurrent modification to self.data_holder despite state signalling")
+            }
+            return Ok(())
+        }
+
+        /// Gets the contents of the cell, initializing it with `f` if the cell was
+        /// empty.
+        ///
+        /// If several threads concurrently run `get_or_init`, more than one `f` can
+        /// be called. However, all threads will return the same value, produced by
+        /// some `f`.
+        /// 
+        /// Warning: In the rare case that one call to this function is writing its
+        /// value to the cell while another execution of `f` has just finished, 
+        /// then the latter call will spinloop until the cell is initialized before 
+        /// returning a reference to the initialized value. The spinloop shouldn't 
+        /// last long as it's only waiting for a one-time memory write, but if this
+        /// is a problem for your application, consider alternatives such as the 
+        /// cells backed by `critical_section`.
+        pub fn get_or_init_spin<F>(&self, f: F) -> &T
+        where
+            F: FnOnce() -> T,
+        {
+            enum Void {}
+            let fn_wrap = || {
+                Ok::<T, Void> (f())
+            };
+            match self.get_or_try_init_spin(fn_wrap) {
+                Ok(val) => val,
+                Err(void) => match void {}
+            }
+        }
+        /// Gets the contents of the cell, initializing it with `f` if
+        /// the cell was empty. If the cell was empty and `f` failed, an
+        /// error is returned.
+        ///
+        /// If several threads concurrently run `get_or_init`, more than one `f` can
+        /// be called. However, all threads will return the same value, produced by
+        /// some `f`.
+        /// 
+        /// Warning: In the rare case that one call to this function is writing its
+        /// value to the cell while another execution of `f` has just finished, 
+        /// then the latter call will spinloop until the cell is initialized before 
+        /// returning a reference to the initialized value. The spinloop shouldn't 
+        /// last long as it's only waiting for a one-time memory write, but if this
+        /// is a problem for your application, consider alternatives such as the 
+        /// cells backed by `critical_section`.
+        pub fn get_or_try_init_spin<F, E>(&self, f: F) -> Result<&T, E>
+        where
+            F: FnOnce() -> Result<T, E>
+        {
+            let mut state_snapshot = self.is_init.load(Ordering::Acquire);
+
+            if state_snapshot == 0 {
+                let f_value = f()?;
+                // Indicate that we are now trying to set the value
+                // If someone else is also trying, break out and wait for the other write to go through
+                // On success we wish to release the new state, without needing to acquire it again
+                // On failure we need to acquire the actual state and wait for the other one setting the value to finish
+                match self.is_init.compare_exchange(0, 1, Ordering::Release, Ordering::Acquire) {
+                    Ok(_) => {
+                        // SAFETY: state==1 -> nobody else is touching the UnsafeCell -> we can safely obtain &mut
+                        let new_ref = unsafe {self.force_set(f_value)};
+                        // Indicate that we have successfully written the value
+                        if self.is_init.swap(2, Ordering::AcqRel) != 1 {
+                            unreachable!("Concurrent modification to self.data_holder despite state signalling")
+                        }
+                        return Ok(new_ref as &T);
+                    },
+                    Err(new_state) => {
+                        state_snapshot = new_state;
+                        debug_assert!(state_snapshot==1 || state_snapshot==2);
+                    }
+                }
+            }
+            while state_snapshot == 1 {
+                // 1 -> someone else is currently writing
+                // Writes (should be) fast so we won't be spinning for long
+                state_snapshot = self.is_init.load(Ordering::Acquire);
+                spin_loop();
+            }
+            debug_assert_eq!(state_snapshot, 2);
+            unsafe {
+                Ok(self.get_data_unchecked())
+            }
+        }
+
+        /// ```compile_fail
+        /// # use once_cell::race::OnceSpin;
+        /// #
+        /// // Ensure that OnceSpin<T> is invariant over T lifetime subtypes
+        /// let heap_object = std::vec::Vec::from([1,2,3,4]);
+        /// let once_storage = OnceSpin::new();
+        /// once_storage.set(&heap_object).unwrap();
+        /// drop(heap_object);
+        /// // The stored reference is no longer live because vec is dropped
+        /// // The following line should fail to compile
+        /// let _ref = once_storage.get();
+        /// ```
+        fn _dummy() {}
+    }
+
+    impl<T> Drop for OnceSpin<T> {
+        fn drop(&mut self) {
+            let state = self.is_init.load(Ordering::Acquire);
+            // &mut self -> nobody else can try to init -> value can't be 1
+            // If we somehow do, then we leak the set value, which is safer than
+            // incorrectly freeing it
+            debug_assert_ne!(state, 1);
+            if state == 2 {
+                unsafe {
+                    let mut_ptr = self.data_holder.get();
+                    (&mut *mut_ptr as &mut MaybeUninit<T>).assume_init_drop();
+                }
+            }
+        }
+    }
+
+    unsafe impl<T: Send+Sync> Sync for OnceSpin<T> {}
+
+    #[cfg(test)]
+    mod tests {
+        
+    }
+}
