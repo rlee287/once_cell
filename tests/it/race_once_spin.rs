@@ -8,6 +8,12 @@ use std::{
 use once_cell::race::OnceSpin;
 
 #[test]
+fn test_with_value() {
+    let once_spin = OnceSpin::with_value(3);
+    assert_eq!(*once_spin.get().unwrap(), 3);
+}
+
+#[test]
 fn test_should_compile_static() {
     let heap_object = std::vec::Vec::from([1,2,3,4]);
     let once_storage = OnceSpin::new();
@@ -65,4 +71,20 @@ fn test_init_try_set_twice() {
 
     assert!(once_spin.set(String::from("snecond")).is_err());
     assert_eq!(once_spin.get().unwrap(), "frist");
+}
+
+#[test]
+fn test_drop_empty() {
+    let x = OnceSpin::<String>::new();
+    drop(x);
+}
+
+#[test]
+fn test_reentrant() {
+    let cell = OnceSpin::new();
+    let res = cell.get_or_init_spin(|| {
+        cell.get_or_init_spin(|| "hello".to_string());
+        "world".to_string()
+    });
+    assert_eq!(res, "hello");
 }

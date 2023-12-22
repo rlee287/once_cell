@@ -429,6 +429,7 @@ mod once_spin {
     /// A thread-safe cell which can only be written to once. Note that the
     /// functions suffixed with `_spin` will spinloop in rare cases, and that
     /// other implementations are preferred if possible.
+    #[derive(Debug)]
     pub struct OnceSpin<T> {
         /// The actual storage of the stored object
         data_holder: UnsafeCell<MaybeUninit<T>>,
@@ -442,6 +443,11 @@ mod once_spin {
         /// Helper counter to assert that the critical section is, in fact, only entered by one thread at a time
         critical_section_ctr: AtomicUsize
     }
+    impl<T> Default for OnceSpin<T> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
     impl<T> OnceSpin<T> {
         /// Creates a new empty cell.
         #[inline]
@@ -453,11 +459,21 @@ mod once_spin {
                 critical_section_ctr: AtomicUsize::new(0)
             }
         }
+        /// Creates a new initialized cell.
+        #[inline]
+        pub const fn with_value(value: T) -> Self {
+            Self {
+                data_holder: UnsafeCell::new(MaybeUninit::new(value)),
+                is_init: AtomicUsize::new(2),
+                #[cfg(debug_assertions)]
+                critical_section_ctr: AtomicUsize::new(0)
+            }
+        }
         /// Gets a reference to the underlying value.
         ///
         /// SAFETY: callers must ensure that the OnceSpin is initialized.
         #[inline]
-        unsafe fn get_data_unchecked(&self) -> &T {
+        pub unsafe fn get_unchecked(&self) -> &T {
             let mut_ptr = self.data_holder.get();
             (&*mut_ptr as &MaybeUninit<T>).assume_init_ref()
         }
@@ -469,7 +485,27 @@ mod once_spin {
                 assert_eq!(self.critical_section_ctr.load(Ordering::SeqCst), 0);
                 // SAFETY: 2 -> value is init and nobody is trying to change it
                 unsafe {
-                    Some(self.get_data_unchecked())
+                    Some(self.get_unchecked())
+                }
+            } else {
+                debug_assert!(state_snapshot <= 1);
+                None
+            }
+        }
+        /// Consumes the `OnceSpin`, returning the wrapped value.
+        /// Returns `None` if the cell was empty.
+        pub fn into_inner(mut self) -> Option<T> {
+            let state_snapshot = self.is_init.load(Ordering::Acquire);
+            if state_snapshot == 2 {
+                #[cfg(debug_assertions)]
+                assert_eq!(self.critical_section_ctr.load(Ordering::SeqCst), 0);
+                // SAFETY: 2 -> value is init and nobody is trying to change it
+                // This function requires `mut self` ownership and thus no
+                // references to the underlying data can be live
+                unsafe {
+                    let cell = core::mem::replace(&mut self.data_holder, UnsafeCell::new(MaybeUninit::uninit()));
+                    self.is_init.store(0, Ordering::Release);
+                    Some(cell.into_inner().assume_init())
                 }
             } else {
                 debug_assert!(state_snapshot <= 1);
@@ -595,7 +631,7 @@ mod once_spin {
             }
             debug_assert_eq!(state_snapshot, 2);
             unsafe {
-                Ok(self.get_data_unchecked())
+                Ok(self.get_unchecked())
             }
         }
 
@@ -610,6 +646,20 @@ mod once_spin {
         /// // The stored reference is no longer live because vec is dropped
         /// // The following line should fail to compile
         /// let _ref = once_storage.get();
+        /// ```
+        ///
+        /// ``` compile_fail
+        /// # use once_cell::race::OnceSpin;
+        /// #
+        /// // Ensure that OnceSpin<T> is invariant over T lifetime subtypes
+        /// let heap_object = std::vec::Vec::from([1,2,3,4]);
+        /// let once_storage = OnceSpin::new();
+        /// once_storage.set(heap_object).unwrap();
+        /// let obj_ref = once_storage.get().unwrap();
+        /// let orig_vec = once_storage.into_inner().unwrap();
+        /// // The stored reference is no longer live because vec is dropped
+        /// // The following line should fail to compile
+        /// println!("{}", obj_ref.len());
         /// ```
         fn _dummy() {}
     }
