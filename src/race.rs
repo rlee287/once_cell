@@ -640,12 +640,12 @@ mod once_spin {
         /// #
         /// // Ensure that OnceSpin<T> is invariant over T lifetime subtypes
         /// let heap_object = std::vec::Vec::from([1,2,3,4]);
-        /// let once_storage = OnceSpin::new();
-        /// once_storage.set(&heap_object).unwrap();
+        /// let once_spin = OnceSpin::new();
+        /// once_spin.set(&heap_object).unwrap();
         /// drop(heap_object);
         /// // The stored reference is no longer live because vec is dropped
         /// // The following line should fail to compile
-        /// let _ref = once_storage.get();
+        /// let _ref = once_spin.get();
         /// ```
         ///
         /// ``` compile_fail
@@ -653,10 +653,10 @@ mod once_spin {
         /// #
         /// // Ensure that OnceSpin<T> is invariant over T lifetime subtypes
         /// let heap_object = std::vec::Vec::from([1,2,3,4]);
-        /// let once_storage = OnceSpin::new();
-        /// once_storage.set(heap_object).unwrap();
-        /// let obj_ref = once_storage.get().unwrap();
-        /// let orig_vec = once_storage.into_inner().unwrap();
+        /// let once_spin = OnceSpin::new();
+        /// once_spin.set(heap_object).unwrap();
+        /// let obj_ref = once_spin.get().unwrap();
+        /// let orig_vec = once_spin.into_inner().unwrap();
         /// // The stored reference is no longer live because vec is dropped
         /// // The following line should fail to compile
         /// println!("{}", obj_ref.len());

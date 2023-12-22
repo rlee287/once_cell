@@ -16,20 +16,20 @@ fn test_with_value() {
 #[test]
 fn test_should_compile_static() {
     let heap_object = std::vec::Vec::from([1,2,3,4]);
-    let once_storage = OnceSpin::new();
-    once_storage.set(heap_object).unwrap();
-    let _ref = once_storage.get();
+    let once_spin = OnceSpin::new();
+    once_spin.set(heap_object).unwrap();
+    let _ref = once_spin.get();
     assert_eq!(_ref.unwrap(), &[1,2,3,4]);
-    drop(once_storage);
+    drop(once_spin);
 }
 
 #[test]
 fn test_should_compile_nonstatic() {
     let heap_object = std::vec::Vec::from([1,2,3,4]);
-    let once_storage = OnceSpin::new();
-    once_storage.set(&heap_object).unwrap();
-    let _ref = once_storage.get();
-    drop(once_storage);
+    let once_spin = OnceSpin::new();
+    once_spin.set(&heap_object).unwrap();
+    let _ref = once_spin.get();
+    drop(once_spin);
     drop(heap_object);
 }
 
@@ -39,13 +39,13 @@ fn test_init_only_once() {
 
     let init_ctr = AtomicUsize::new(0);
     let barrier_obj = Barrier::new(THREAD_COUNT+1);
-    let once_storage = OnceSpin::new();
+    let once_spin = OnceSpin::new();
     scope(|s| {
         // Start the threads...
         for _ in 0..THREAD_COUNT {
             s.spawn(|| {
                 barrier_obj.wait();
-                if once_storage.set(std::vec::Vec::from([std::string::String::from("abcd")])).is_ok() {
+                if once_spin.set(std::vec::Vec::from([std::string::String::from("abcd")])).is_ok() {
                     init_ctr.fetch_add(1, Ordering::Relaxed);
                 }
             });
@@ -58,8 +58,8 @@ fn test_init_only_once() {
     // Check that object was only initialized once
     assert_eq!(init_ctr.load(Ordering::Acquire), 1);
     // Now read from the vec so that Miri can catch invalid accesses
-    assert_eq!(once_storage.get().unwrap().len(), 1);
-    assert_eq!(once_storage.get().unwrap()[0], "abcd");
+    assert_eq!(once_spin.get().unwrap().len(), 1);
+    assert_eq!(once_spin.get().unwrap()[0], "abcd");
 }
 
 #[test]
